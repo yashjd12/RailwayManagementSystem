@@ -179,82 +179,103 @@ app.get('/api/trains/availability', (req, res) => {
 
 // Book a Seat
 app.post('/api/trains/:train_id/book', authenticateToken, (req, res) => {
-    const { user_id, no_of_seats } = req.body;
-    const { train_id } = req.params;
-  
-    // Check if the requested number of seats are available
-    const availabilityQuery = 'SELECT seat_capacity - IFNULL((SELECT SUM(no_of_seats) FROM bookings WHERE bookings.train_id = ?), 0) AS available_seats FROM trains WHERE id = ?';
-    db.query(availabilityQuery, [train_id, train_id], (err, results) => {
+  const { user_id, no_of_seats } = req.body;
+  const { train_id } = req.params;
+
+  // Check if the requested number of seats are available
+  const availabilityQuery =
+    'SELECT seat_capacity - IFNULL((SELECT SUM(no_of_seats) FROM bookings WHERE bookings.train_id = ?), 0) AS available_seats FROM trains WHERE id = ?';
+  db.query(availabilityQuery, [train_id, train_id], (err, results) => {
+    if (err) {
+      console.error('Failed to check seat availability:', err);
+      res.status(500).json({ message: 'Failed to check seat availability', status_code: 500 });
+      return;
+    }
+
+    const availableSeats = results[0].available_seats;
+
+    if (availableSeats < no_of_seats) {
+      res.status(400).json({ message: 'Not enough seats available', status_code: 400 });
+      return;
+    }
+
+    // Start a transaction to handle the booking
+    db.beginTransaction(err => {
       if (err) {
-        console.error('Failed to check seat availability:', err);
-        res.status(500).json({ message: 'Failed to check seat availability', status_code: 500 });
+        console.error('Failed to start transaction:', err);
+        res.status(500).json({ message: 'Failed to start transaction', status_code: 500 });
         return;
       }
-  
-      const availableSeats = results[0].available_seats;
-  
-      if (availableSeats < no_of_seats) {
-        res.status(400).json({ message: 'Not enough seats available', status_code: 400 });
-        return;
-      }
-  
-      // Start a transaction to handle the booking
-      db.beginTransaction(err => {
+
+      // Insert the booking into the database
+      const bookingQuery = 'INSERT INTO bookings (user_id, train_id, no_of_seats) VALUES (?, ?, ?)';
+      db.query(bookingQuery, [user_id, train_id, no_of_seats], (err, result) => {
         if (err) {
-          console.error('Failed to start transaction:', err);
-          res.status(500).json({ message: 'Failed to start transaction', status_code: 500 });
+          db.rollback(() => {
+            console.error('Failed to book seat:', err);
+            res.status(500).json({ message: 'Failed to book seat', status_code: 500 });
+          });
           return;
         }
-  
-        // Insert the booking into the database
-        const bookingQuery = 'INSERT INTO bookings (user_id, train_id, no_of_seats) VALUES (?, ?, ?)';
-        db.query(bookingQuery, [user_id, train_id, no_of_seats], (err, result) => {
+
+        const bookingId = result.insertId;
+
+        // Fetch the maximum seat number for the train from previous bookings
+        const lastSeatNumberQuery =
+          'SELECT MAX(CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(seat_numbers, ",", -1), ",", 1) AS UNSIGNED)) AS last_seat_number FROM bookings WHERE train_id = ?';
+        db.query(lastSeatNumberQuery, [train_id], (err, result) => {
           if (err) {
             db.rollback(() => {
-              console.error('Failed to book seat:', err);
+              console.error('Failed to fetch last seat number:', err);
               res.status(500).json({ message: 'Failed to book seat', status_code: 500 });
             });
             return;
           }
-  
-          const bookingId = result.insertId;
-  
-        // Update the seat numbers for the booking
-        const seatNumbers = Array.from({ length: no_of_seats }, (_, i) => i + 1);
-        const updateQuery = 'UPDATE bookings SET seat_numbers = ? WHERE id = ?';
-        db.query(updateQuery, [seatNumbers[1], bookingId], (err) => {
-        if (err) {
-            db.rollback(() => {
-            console.error('Failed to update seat numbers:', err);
-            res.status(500).json({ message: 'Failed to book seat', status_code: 500 });
-            });
-            return;
-        }
 
-        // Commit the transaction
-        db.commit(err => {
+          let lastSeatNumber = result[0].last_seat_number || 0;
+          const seatNumbers = Array.from({ length: no_of_seats }, (_, i) => {
+            lastSeatNumber++;
+            return lastSeatNumber;
+          });
+
+          // Update the seat numbers for the booking
+          const updateQuery = 'UPDATE bookings SET seat_numbers = ? WHERE id = ?';
+          db.query(updateQuery, [seatNumbers.join(','), bookingId], (err) => {
             if (err) {
-            db.rollback(() => {
-                console.error('Failed to commit transaction:', err);
+              db.rollback(() => {
+                console.error('Failed to update seat numbers:', err);
                 res.status(500).json({ message: 'Failed to book seat', status_code: 500 });
-            });
-            return;
+              });
+              return;
             }
 
-            res.json({ message: 'Seat booked successfully', booking_id: bookingId, seat_number: seatNumbers[1] });
-        });
-        });
+            // Commit the transaction
+            db.commit(err => {
+              if (err) {
+                db.rollback(() => {
+                  console.error('Failed to commit transaction:', err);
+                  res.status(500).json({ message: 'Failed to book seat', status_code: 500 });
+                });
+                return;
+              }
 
+              res.json({ message: 'Seat booked successfully', booking_id: bookingId, seat_numbers: seatNumbers.join(',') });
+            });
+          });
         });
       });
     });
+  });
 });
+
+
 
 
 
 // Get Specific Booking Details
 app.get('/api/bookings/:booking_id', authenticateToken, (req, res) => {
     const { booking_id } = req.params;
+    const {user_id} = req.body;
   
     // Fetch the booking details
     const query = 'SELECT bookings.id AS booking_id, trains.id AS train_id, train_name, user_id, no_of_seats, seat_numbers, arrival_time_at_source, arrival_time_at_destination FROM bookings INNER JOIN trains ON bookings.train_id = trains.id WHERE bookings.id = ?';
